@@ -6,6 +6,10 @@ from transformer.Layers import EncoderLayer, DecoderLayer
 import sys
 from torch.nn import CrossEntropyLoss
 
+
+__author__ = "Yu-Hsiang Huang"
+
+
 def get_pad_mask(seq, pad_idx):
     return (seq != pad_idx).unsqueeze(-2)
 
@@ -83,7 +87,7 @@ class Decoder(nn.Module):
 
     def __init__(
             self, n_trg_vocab, d_word_vec, n_layers, n_head, d_k, d_v,
-            d_model, d_inner, pad_idx, n_position=200, dropout=0.1):
+            d_model, d_inner, pad_idx, n_position=200, dropout=0.1, keyword_module=None):
 
         super().__init__()
 
@@ -91,11 +95,11 @@ class Decoder(nn.Module):
         self.position_enc = PositionalEncoding(d_word_vec, n_position=n_position)
         self.dropout = nn.Dropout(p=dropout)
         self.layer_stack = nn.ModuleList([
-            DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
+            DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout, keyword_module=keyword_module)
             for _ in range(n_layers)])
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
 
-    def forward(self, trg_seq, trg_mask, enc_output, src_mask, return_attns=False):
+    def forward(self, trg_seq, trg_mask, enc_output, src_mask, return_attns=False, key_score=None):
 
         dec_slf_attn_list, dec_enc_attn_list = [], []
 
@@ -105,7 +109,7 @@ class Decoder(nn.Module):
 
         for dec_layer in self.layer_stack:
             dec_output, dec_slf_attn, dec_enc_attn = dec_layer(
-                dec_output, enc_output, slf_attn_mask=trg_mask, dec_enc_attn_mask=src_mask)
+                dec_output, enc_output, slf_attn_mask=trg_mask, dec_enc_attn_mask=src_mask, key_score=key_score)
             dec_slf_attn_list += [dec_slf_attn] if return_attns else []
             dec_enc_attn_list += [dec_enc_attn] if return_attns else []
 
@@ -121,7 +125,7 @@ class Transformer(nn.Module):
             self, n_src_vocab, n_trg_vocab, src_pad_idx, trg_pad_idx,
             d_word_vec=512, d_model=512, d_inner=2048,
             n_layers=6, n_head=8, d_k=64, d_v=64, dropout=0.1, n_position=200,
-            trg_emb_prj_weight_sharing=True, emb_src_trg_weight_sharing=True):
+            keyword_module=None, trg_emb_prj_weight_sharing=True, emb_src_trg_weight_sharing=True):
 
         super().__init__()
 
@@ -137,7 +141,7 @@ class Transformer(nn.Module):
             n_trg_vocab=n_trg_vocab, n_position=n_position,
             d_word_vec=d_word_vec, d_model=d_model, d_inner=d_inner,
             n_layers=n_layers, n_head=n_head, d_k=d_k, d_v=d_v,
-            pad_idx=trg_pad_idx, dropout=dropout)
+            pad_idx=trg_pad_idx, dropout=dropout, keyword_module=keyword_module)
 
         self.trg_word_prj = nn.Linear(d_model, n_trg_vocab, bias=False)
 
@@ -159,13 +163,28 @@ class Transformer(nn.Module):
             self.encoder.src_word_emb.weight = self.decoder.trg_word_emb.weight
 
 
-    def forward(self, src_seq, trg_seq, labels=None,):
+    def forward(self, src_seq, trg_seq, labels=None, keyword=None,):
 
         src_mask = get_pad_mask(src_seq, self.src_pad_idx)
         trg_mask = get_pad_mask(trg_seq, self.trg_pad_idx) & get_subsequent_mask(trg_seq)
 
         enc_output, *_ = self.encoder(src_seq, src_mask)
-        dec_output, *_ = self.decoder(trg_seq, trg_mask, enc_output, src_mask)
+
+        encoded_layers_key = enc_output
+        key_score = keyword.tolist()
+        for i, score in enumerate(key_score):
+            key_score_list = list(filter(lambda a: a != self.src_pad_idx, score))
+            if len(key_score_list) != 1:
+                key_score_list = list(map(lambda a: a - min(key_score_list), key_score_list))
+                key_score_list = list(map(lambda a: a / max(key_score_list), key_score_list))
+            else:
+                key_score_list = [1]
+
+            tmp = torch.tensor(key_score_list)
+            tmp = tmp.tolist()
+            for k, v in enumerate(tmp):
+                encoded_layers_key[i][k + 1] = encoded_layers_key[i][k + 1] * v
+        dec_output, *_ = self.decoder(trg_seq, trg_mask, enc_output, src_mask, key_score=encoded_layers_key)
         lm_logits = self.trg_word_prj(dec_output) * self.x_logit_scale
 
         outputs = (lm_logits,)

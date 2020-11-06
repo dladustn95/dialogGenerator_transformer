@@ -13,8 +13,8 @@ import torch
 import torch.nn.functional as F
 
 from transformers import OpenAIGPTLMHeadModel, GPT2Config, OpenAIGPTConfig, OpenAIGPTTokenizer, GPT2LMHeadModel, GPT2Tokenizer, BertTokenizer, BertModel
-from train import SPECIAL_TOKENS, build_input_from_segments, add_special_tokens_, ATTR_TO_SPECIAL_TOKEN
-from utils import get_test_datasetEN2, download_pretrained_model
+from train_key import SPECIAL_TOKENS, build_input_from_segments, add_special_tokens_, ATTR_TO_SPECIAL_TOKEN
+from utils import get_test_datasetEN, download_pretrained_model
 from transformer.Models import Transformer
 
 def top_filtering(logits, top_k=0., top_p=0.9, threshold=-float('Inf'), filter_value=-float('Inf')):
@@ -56,18 +56,19 @@ def top_filtering(logits, top_k=0., top_p=0.9, threshold=-float('Inf'), filter_v
     return logits
 
 
-def sample_sequence(source, bert_tokenizer, model, gpt_tokenizer, args, current_output=None):
+def sample_sequence(source, score, bert_tokenizer, model, gpt_tokenizer, args, current_output=None):
     special_tokens_ids = gpt_tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS)
     if current_output is None:
         current_output = []
 
     for i in range(args.max_length):
-        instance = build_input_from_segments(source, current_output, bert_tokenizer, gpt_tokenizer, with_eos=False)
+        instance = build_input_from_segments(source, current_output, score, bert_tokenizer, gpt_tokenizer, with_eos=False)
 
         input_ids = torch.tensor(instance["source_ids"], device=args.device).unsqueeze(0)
         target_ids = torch.tensor(instance["target_ids"], device=args.device).unsqueeze(0)
+        keyword_scores = torch.tensor(instance["key_scores"], device=args.device).unsqueeze(0)
 
-        logits = model(input_ids, target_ids)
+        logits = model(input_ids, target_ids, keyword=keyword_scores)
         if isinstance(logits, tuple):  # for gpt2 and maybe others
             logits = logits[0]
         logits = logits[0, -1, :] / args.temperature
@@ -98,6 +99,7 @@ def run():
     parser.add_argument("--max_length", type=int, default=30, help="Maximum length of the output utterances")
     parser.add_argument("--min_length", type=int, default=4, help="Minimum length of the output utterances")
     parser.add_argument("--seed", type=int, default=0, help="Seed")
+    parser.add_argument("--keyword_module", type=str, default="new", help="add, attention, ")
     parser.add_argument("--temperature", type=int, default=0.8, help="Sampling softmax temperature")
     parser.add_argument("--top_k", type=int, default=30, help="Filter top-k tokens before sampling (<=0: no filtering)")
     parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)")
@@ -149,16 +151,18 @@ def run():
         d_inner=args.d_inner_hid,
         n_layers=args.n_layers,
         n_head=args.n_head,
-        dropout=args.dropout).to(args.device)
+        dropout=args.dropout,
+        n_position=512,
+        keyword_module=args.keyword_module).to(args.device)
 
     model.load_state_dict(torch.load(args.model_checkpoint), strict=False)
     model.eval()
 
-    sourceList, targetList = get_test_datasetEN2(tokenizer, tokenizer, args.dataset_path)
+    sourceList, targetList, scoreList = get_test_datasetEN(tokenizer, tokenizer, args.dataset_path)
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     f1 = open((args.model_checkpoint + current_time + "_output.txt"), 'w')
-    for line in tqdm(zip(sourceList, targetList), total=len(sourceList)):
-        out_ids = sample_sequence(line[0], tokenizer, model, tokenizer, args)
+    for line in tqdm(zip(sourceList, targetList, scoreList), total=len(sourceList)):
+        out_ids = sample_sequence(line[0], line[2], tokenizer, model, tokenizer, args)
         out_texts = tokenizer.decode(out_ids)
         for text in out_texts:
             f1.write(text.replace('▁', ' ').replace('</s>', ' '))

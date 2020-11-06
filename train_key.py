@@ -15,18 +15,16 @@ from ignite.handlers import ModelCheckpoint
 from ignite.metrics import Accuracy, Loss, MetricsLambda, RunningAverage
 from ignite.contrib.handlers import ProgressBar, PiecewiseLinear
 from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger, OutputHandler, OptimizerParamsHandler
-from transformers import (AdamW, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer, GPT2Config, OpenAIGPTConfig,
-                                  GPT2LMHeadModel, GPT2Tokenizer, WEIGHTS_NAME, CONFIG_NAME,
-                          BertTokenizer, BertModel)
+from transformers import (AdamW, OpenAIGPTTokenizer, GPT2Tokenizer, WEIGHTS_NAME)
 
-from utils import get_datasetEn2, make_logdir
+from utils import get_datasetEn, make_logdir
 from transformer.Models import Transformer
 import torch.nn.functional as F
 
 SPECIAL_TOKENS = ["<bos>", "<eos>", "<pad>"]
 ATTR_TO_SPECIAL_TOKEN = {'bos_token': '<bos>', 'eos_token': '<eos>', 'pad_token': '<pad>'}
-MODEL_INPUTS = ["source_ids", "target_ids", "lm_labels"]
-PADDED_INPUTS = ["source_ids", "target_ids", "lm_labels"]
+MODEL_INPUTS = ["source_ids", "target_ids", "lm_labels", "key_scores"]
+PADDED_INPUTS = ["source_ids", "target_ids", "lm_labels", "key_scores"]
 
 logger = logging.getLogger(__file__)
 
@@ -41,13 +39,18 @@ def average_distributed_scalar(scalar, args):
 def pad_dataset(dataset, padding=0):
     """ Pad the dataset. This could be optimized by defining a Dataset class and padding at the batch level, but this is simpler. """
     max_s = max(len(x) for x in dataset["source_ids"])
+    max_k = max(len(x) for x in dataset["key_scores"])
+    max_l = max(max_s, max_k)
     max_t = max(len(x) for x in dataset["target_ids"])
-    max_l = max(max_s, max_t)
     for name in PADDED_INPUTS:
         if name == "source_ids":
-            dataset[name] = [x + [0] * (max_l - len(x)) for x in dataset[name]]
+            dataset[name] = [x + [padding] * (max_l - len(x)) for x in dataset[name]]
         else:
-            dataset[name] = [x + [padding if name != "lm_labels" else -100] * (max_l - len(x)) for x in dataset[name]]
+            if name == "key_scores":
+                dataset[name] = [x + [padding] * (max_l - len(x)) for x in dataset[name]]
+            else:
+                dataset[name] = [x + [padding if name != "lm_labels" else -100] * (max_t - len(x)) for x in dataset[name]]
+
     return dataset
 
 def add_special_tokens_(model, tokenizer):
@@ -57,7 +60,7 @@ def add_special_tokens_(model, tokenizer):
     if num_added_tokens > 0:
         model.resize_token_embeddings(new_num_tokens=orig_num_tokens + num_added_tokens)
 
-def build_input_from_segments(source, target, bert_tokenizer, tokenizer, lm_labels=False, with_eos=True):
+def build_input_from_segments(source, target, score, tokenizer, lm_labels=False, with_eos=True):
     """ Build a sequence of input from 3 segments: persona, history and last reply. """
     bos2, eos2 = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS[:-1])
 
@@ -67,7 +70,7 @@ def build_input_from_segments(source, target, bert_tokenizer, tokenizer, lm_labe
     instance["lm_labels"] = [-100] * len(instance["target_ids"])
     if lm_labels:
         instance["lm_labels"] = [-100] + target + ([eos2] if with_eos else [])
-
+    instance["key_scores"] = score
     return instance
 
 def get_data_loaders(args, bert_tokenizer, tokenizer):
@@ -75,14 +78,14 @@ def get_data_loaders(args, bert_tokenizer, tokenizer):
     logger.info("Build inputs and labels")
     datasets = {"train": defaultdict(list), "valid": defaultdict(list)}
 
-    sourceList_train, targetList_train, sourceList_valid, targetList_valid = get_datasetEn2(bert_tokenizer, tokenizer, args.dataset_path)
-    for line in zip(sourceList_train, targetList_train):
-        instance = build_input_from_segments(line[0], line[1], bert_tokenizer, tokenizer, True)
+    sourceList_train, targetList_train, attentionList_train, sourceList_valid, targetList_valid, attentionList_valid = get_datasetEn(bert_tokenizer, tokenizer, args.dataset_path)
+    for line in zip(sourceList_train, targetList_train, attentionList_train):
+        instance = build_input_from_segments(line[0], line[1], line[2], tokenizer, True)
         for input_name, input_array in instance.items():
             datasets["train"][input_name].append(input_array)
 
-    for line in zip(sourceList_valid, targetList_valid):
-        instance = build_input_from_segments(line[0], line[1], bert_tokenizer, tokenizer, True)
+    for line in zip(sourceList_valid, targetList_valid, attentionList_valid):
+        instance = build_input_from_segments(line[0], line[1], line[2], tokenizer, True)
         for input_name, input_array in instance.items():
             datasets["valid"][input_name].append(input_array)
 
@@ -143,12 +146,13 @@ def train():
     parser.add_argument("--dataset_path", type=str, default="", help="Path or url of the dataset.")
     parser.add_argument("--train_batch_size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--valid_batch_size", type=int, default=64, help="Batch size for validation")
+    parser.add_argument("--keyword_module", type=str, default="new", help="add, attention, ")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Accumulate gradients on several steps")
     parser.add_argument("--lr", type=float, default=6.25e-4, help="Learning rate")
     parser.add_argument("--max_norm", type=float, default=1.0, help="Clipping gradient norm")
     parser.add_argument("--n_epochs", type=int, default=15, help="Number of training epochs")
     parser.add_argument("--eval_before_start", action='store_true', help="If true start with a first evaluation before training")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu)")
+    parser.add_argument("--device", type=str, default="cpu" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu)")
     parser.add_argument("--fp16", type=str, default="", help="Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training (-1: not distributed)")
     parser.add_argument("--gpt2_model_name", type=str, default="gpt2", help="Path, url or short name of the model")
@@ -204,7 +208,9 @@ def train():
         d_inner=args.d_inner_hid,
         n_layers=args.n_layers,
         n_head=args.n_head,
-        dropout=args.dropout).to(args.device)
+        dropout=args.dropout,
+        n_position=512,
+        keyword_module=args.keyword_module).to(args.device)
 
 
     optimizer = AdamW(model.parameters(), lr=args.lr, correct_bias=True)
@@ -223,9 +229,9 @@ def train():
     def update(engine, batch):
         model.train()
         batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
-        source_ids, target_ids, lm_labels = batch
+        source_ids, target_ids, lm_labels, keyword_scores = batch
 
-        (lm_loss), *_ = model(source_ids, target_ids, labels=lm_labels)
+        (lm_loss), *_ = model(source_ids, target_ids, labels=lm_labels, keyword=keyword_scores)
 
         loss = lm_loss / args.gradient_accumulation_steps
         if args.fp16:
@@ -246,10 +252,10 @@ def train():
         model.eval()
         with torch.no_grad():
             batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
-            source_ids, target_ids, lm_labels = batch
+            source_ids, target_ids, lm_labels, keyword_scores = batch
             #logger.info(tokenizer.decode(target_ids[0].tolist()))
 
-            lm_logits, *_ = model(source_ids, target_ids)
+            lm_logits, *_ = model(source_ids, target_ids, keyword=keyword_scores)
             lm_logits_flat_shifted = lm_logits[..., :-1, :].contiguous().view(-1, lm_logits.size(-1))
             lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
             return (lm_logits_flat_shifted,), (lm_labels_flat_shifted,)
